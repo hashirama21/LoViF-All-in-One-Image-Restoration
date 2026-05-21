@@ -1,0 +1,57 @@
+# configs/train_full.yaml
+# Full pipeline: LoRA + degradation encoder + physical priors + composite augmentation
+
+defaults:
+  - _self_
+
+project:
+  name: lovif2026
+  run_name: full_lora_encoder
+  seed: 42
+  output_dir: ./outputs/${project.run_name}
+
+data:
+  train_dir: ./data/train
+  val_dir: ./data/validation
+  image_size: 512
+  batch_size: 4
+  num_workers: 4
+  composite_prob: 0.35      # 35% mixed degradation batches (max 40%)
+  composite_pairs:
+    - [blur, noise]
+    - [rain, low_light]
+    - [haze, noise]
+    - [snow, low_light]
+    - [blur, low_light]
+
+model:
+  backbone: foundir
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.1
+  lora_target_modules: [to_q, to_k, to_v, to_out.0]
+  use_degradation_encoder: true
+  encoder_dim: 512
+  use_physical_priors: true
+
+training:
+  max_steps: 80000
+  lr: 5e-5
+  warmup_steps: 1000
+  gradient_accumulation_steps: 4
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  weight_decay: 0.01
+  save_every: 5000
+  eval_every: 2500
+  early_stopping_patience: 8   # in eval intervals
+
+loss:
+  l1_weight: 1.0
+  lpips_weight: 0.15
+  adversarial_weight: 0.01
+  pixel_loss_weight: 0.1       # weight on decoded x0 pixel losses vs diffusion MSE
+
+logging:
+  use_wandb: true
+  log_images_every: 1000

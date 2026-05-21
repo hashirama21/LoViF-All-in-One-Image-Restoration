@@ -1,0 +1,42 @@
+# configs/train_baseline.yaml
+# Reproduce FoundIR baseline on LoViF 2026 data (no LoRA, no encoder, no priors)
+
+defaults:
+  - _self_
+
+project:
+  name: lovif2026
+  run_name: baseline_foundir
+  seed: 42
+  output_dir: ./outputs/${project.run_name}
+
+data:
+  train_dir: ./data/train
+  val_dir: ./data/validation
+  image_size: 512
+  batch_size: 4
+  num_workers: 4
+  composite_prob: 0.0          # disabled for baseline
+
+model:
+  backbone: foundir
+  lora_rank: 0                 # disabled for baseline
+  use_degradation_encoder: false
+  use_physical_priors: false
+
+training:
+  max_steps: 50000
+  lr: 1e-4
+  warmup_steps: 500
+  gradient_accumulation_steps: 4
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  save_every: 5000
+  eval_every: 2500
+  early_stopping_patience: 8
+
+loss:
+  l1_weight: 1.0
+  lpips_weight: 0.0
+  adversarial_weight: 0.0
+  pixel_loss_weight: 0.0       # diffusion MSE only for baseline

@@ -1,0 +1,23 @@
+# configs/inference.yaml
+# Final inference: TTA + ensemble for challenge submission
+
+defaults:
+  - _self_
+
+inference:
+  checkpoints:
+    - ./outputs/full_lora_encoder/best.ckpt     # PSNR-oriented checkpoint
+    - ./outputs/dpo_stage/best.ckpt             # Perceptual-oriented checkpoint
+  ensemble_weights: [0.45, 0.55]               # slight bias toward perceptual
+  num_inference_steps: 25
+  guidance_scale: 7.5
+
+  tta:
+    enabled: true
+    transforms: [identity, hflip, vflip, rot90]  # 4-way TTA
+    merge: mean
+
+  input_dir: ./validation_inputs
+  output_dir: ./validation_outputs
+  batch_size: 1                                  # TTA + ensemble = memory-heavy
+  device: cuda

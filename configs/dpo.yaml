@@ -1,0 +1,38 @@
+# configs/dpo.yaml
+# Preference Optimization stage — runs AFTER train_full converges
+
+defaults:
+  - _self_
+
+project:
+  name: lovif2026
+  run_name: dpo_stage
+  seed: 42
+  output_dir: ./outputs/${project.run_name}
+
+model:
+  lora_rank: 32
+  use_degradation_encoder: true
+  encoder_dim: 512
+  use_physical_priors: true
+
+dpo:
+  base_checkpoint: ./outputs/full_lora_encoder/best.ckpt
+  preferences_dir: ./data/dpo_pairs        # dir with (chosen, rejected, lq) triplets
+  n_generations_per_image: 5               # generate N restorations, keep best/worst
+  reward_weights:
+    musiq: 0.5
+    clip_iqa: 0.3
+    lpips_inv: 0.2
+  beta: 0.1                                # KL penalty
+  lr: 2e-6
+  warmup_steps: 100
+  max_steps: 3000
+  batch_size: 2
+  gradient_accumulation_steps: 4
+
+data:
+  val_dir: ./data/validation
+
+logging:
+  use_wandb: false
