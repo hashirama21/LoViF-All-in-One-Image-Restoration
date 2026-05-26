@@ -51,6 +51,7 @@ loss:
   lpips_weight: 0.15
   adversarial_weight: 0.01
   pixel_loss_weight: 0.1       # weight on decoded x0 pixel losses vs diffusion MSE
+  snr_gamma: 5.0               # Min-SNR weighting (Hang et al., 2023); 0 to disable
 
 logging:
   use_wandb: true

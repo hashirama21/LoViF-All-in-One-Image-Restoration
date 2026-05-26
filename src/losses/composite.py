@@ -1,12 +1,13 @@
 """
 Loss modules for LoViF 2026.
 
-DiffusionLoss  — primary DDPM noise-prediction MSE (latent space).
+DiffusionLoss  — primary DDPM noise-prediction MSE with Min-SNR weighting.
 CompositeLoss  — pixel-space L1 + perceptual LPIPS + adversarial PatchGAN.
                  Applied on the x0 estimate decoded from the diffusion forward.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -21,14 +22,43 @@ from src.utils.registry import LossRegistry
 # ---------------------------------------------------------------------------
 
 class DiffusionLoss(nn.Module):
-    """MSE between predicted and target noise in latent space."""
+    """
+    MSE between predicted and target noise, optionally weighted by Min-SNR.
+
+    Min-SNR weighting (Hang et al., 2023) upweights medium-noise timesteps
+    (SNR ≈ 1–10) which contribute most to perceptual quality, improving
+    convergence speed and final quality at no extra cost.
+
+    Args:
+        snr_gamma: Min-SNR clamp value (γ=5 per the paper). Set to 0 to disable.
+    """
+
+    def __init__(self, snr_gamma: float = 5.0) -> None:
+        super().__init__()
+        self.snr_gamma = snr_gamma
 
     def forward(
         self,
         noise_pred: torch.Tensor,
         noise_target: torch.Tensor,
+        alphas_cumprod_t: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        loss = F.mse_loss(noise_pred, noise_target)
+        """
+        Args:
+            noise_pred, noise_target: [B, C, H, W]
+            alphas_cumprod_t:         [B] — scheduler.alphas_cumprod[t], for SNR weighting.
+                                      Pass None to use plain MSE.
+        """
+        per = F.mse_loss(noise_pred, noise_target, reduction="none").mean([1, 2, 3])  # [B]
+
+        if alphas_cumprod_t is not None and self.snr_gamma > 0:
+            a    = alphas_cumprod_t.float()
+            snr  = a / (1.0 - a).clamp(min=1e-8)               # [B]
+            w    = snr.clamp(max=self.snr_gamma) / snr          # [B]
+            loss = (per * w).mean()
+        else:
+            loss = per.mean()
+
         return loss, {"diffusion_mse": loss.item()}
 
 
@@ -54,7 +84,7 @@ class PerceptualLoss(nn.Module):
 
 
 class PatchGANDiscriminator(nn.Module):
-    """70x70 PatchGAN discriminator (pix2pix). Input: concat(pred, lq)."""
+    """70×70 PatchGAN discriminator (pix2pix). Input: concat(lq, pred)."""
 
     def __init__(self, in_channels: int = 3, ndf: int = 64) -> None:
         super().__init__()
@@ -115,12 +145,12 @@ class CompositeLoss(nn.Module):
     Breakdown values are raw (unweighted) for interpretable logging.
     """
 
-    def __init__(self, weights: LossWeights = LossWeights()) -> None:
+    def __init__(self, weights: Optional[LossWeights] = None) -> None:
         super().__init__()
-        self.weights = weights
-        self.l1 = L1Loss()
-        self.perceptual = PerceptualLoss() if weights.lpips > 0 else None
-        self.adversarial = AdversarialLoss() if weights.adversarial > 0 else None
+        self.weights    = weights if weights is not None else LossWeights()
+        self.l1         = L1Loss()
+        self.perceptual = PerceptualLoss() if self.weights.lpips > 0 else None
+        self.adversarial = AdversarialLoss() if self.weights.adversarial > 0 else None
 
     def forward(
         self,

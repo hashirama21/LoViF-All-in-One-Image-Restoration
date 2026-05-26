@@ -20,7 +20,7 @@ env/
 
 # ML artefacts — too large for git
 outputs/
-data/
+/data/          # root-level data dir only; src/data/ (source code) is tracked
 *.ckpt
 *.pt
 *.pth

@@ -25,9 +25,10 @@ class DPOTrainer:
     """
     Preference optimization stage.
 
-    Reference model = frozen copy of the base checkpoint.
+    Reference model = frozen copy of the base checkpoint (no graph built).
     Policy model    = trainable (LoRA + encoder projections only).
     Log-prob proxy  = negative noise-prediction MSE in latent space.
+    Breakdown is averaged across all accumulation sub-batches (not last-only).
     """
 
     def __init__(self, cfg: DictConfig) -> None:
@@ -77,7 +78,6 @@ class DPOTrainer:
     def _load_model(self, ckpt_path: str, trainable: bool) -> RestorationPipeline:
         state = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-        # Prefer config stored in the checkpoint; fall back to cfg.model
         if "model_config" in state:
             model_cfg = PipelineConfig(**state["model_config"])
         else:
@@ -98,24 +98,32 @@ class DPOTrainer:
 
         return model
 
-    def _compute_log_prob(
-        self,
-        model: RestorationPipeline,
-        lq: torch.Tensor,
-        target: torch.Tensor,
+    # ------------------------------------------------------------------
+    # Log-prob proxies — separated so reference always runs under no_grad
+    # ------------------------------------------------------------------
+
+    def _compute_policy_log_prob(
+        self, lq: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Proxy log-prob: negative noise-prediction MSE.
-        Higher = model denoises better toward `target` = more likely.
-        """
+        """Policy proxy — gradients flow through noise_pred."""
         with torch.autocast(self.device.type, dtype=self._dtype):
-            noise_pred, noise, _ = model(lq, target)
-        return -F.mse_loss(noise_pred, noise, reduction="none").mean(dim=[1, 2, 3])
+            noise_pred, noise, _, _ = self.policy(lq, target)
+        return -F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3])
+
+    def _compute_ref_log_prob(
+        self, lq: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """Reference proxy — no graph constructed, no memory overhead."""
+        with torch.no_grad(), torch.autocast(self.device.type, dtype=self._dtype):
+            noise_pred, noise, _, _ = self.reference(lq, target)
+        return -F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3])
+
+    # ------------------------------------------------------------------
 
     def fit(self) -> None:
-        step = 0
+        step     = 0
         max_steps = self.cfg.dpo.max_steps
-        accum = self.cfg.dpo.gradient_accumulation_steps
+        accum    = self.cfg.dpo.gradient_accumulation_steps
 
         logger.info(f"DPO stage — {max_steps} steps on {self.device}.")
         self.policy.train()
@@ -125,6 +133,9 @@ class DPOTrainer:
 
         while step < max_steps:
             self.optimizer.zero_grad()
+
+            # Accumulate breakdown across sub-batches for accurate logging
+            accum_bd: dict[str, list[float]] = {}
 
             for _ in range(accum):
                 try:
@@ -137,15 +148,20 @@ class DPOTrainer:
                 chosen   = batch["chosen"].to(self.device)
                 rejected = batch["rejected"].to(self.device)
 
-                pi_chosen    = self._compute_log_prob(self.policy,    lq, chosen)
-                pi_rejected  = self._compute_log_prob(self.policy,    lq, rejected)
-                ref_chosen   = self._compute_log_prob(self.reference, lq, chosen)
-                ref_rejected = self._compute_log_prob(self.reference, lq, rejected)
+                pi_chosen    = self._compute_policy_log_prob(lq, chosen)
+                pi_rejected  = self._compute_policy_log_prob(lq, rejected)
+                ref_chosen   = self._compute_ref_log_prob(lq, chosen)
+                ref_rejected = self._compute_ref_log_prob(lq, rejected)
 
-                loss, breakdown = self.dpo_loss(
+                loss, bd = self.dpo_loss(
                     pi_chosen, pi_rejected, ref_chosen, ref_rejected
                 )
                 (loss / accum).backward()
+
+                for k, v in bd.items():
+                    accum_bd.setdefault(k, []).append(v)
+
+            breakdown = {k: sum(v) / len(v) for k, v in accum_bd.items()}
 
             torch.nn.utils.clip_grad_norm_(
                 list(self.policy.trainable_parameters()), 1.0

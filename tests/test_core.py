@@ -92,6 +92,29 @@ def test_diffusion_loss_zero_when_perfect():
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
+def test_diffusion_loss_minsnr_weighting():
+    """Min-SNR weights should lower loss at high-noise timesteps (low alpha)."""
+    loss_fn_snr  = DiffusionLoss(snr_gamma=5.0)
+    loss_fn_plain = DiffusionLoss(snr_gamma=0.0)
+    pred   = torch.randn(4, 4, 8, 8)
+    target = torch.randn(4, 4, 8, 8)
+    # Very low alpha_t → very high noise → SNR ≪ 1 → weight < 1 → weighted loss < plain
+    alpha_low = torch.full((4,), 0.01)
+    loss_snr, _   = loss_fn_snr(pred, target, alphas_cumprod_t=alpha_low)
+    loss_plain, _ = loss_fn_plain(pred, target)
+    assert loss_snr.item() < loss_plain.item()
+
+
+def test_composite_loss_default_weights():
+    """CompositeLoss(None) must not raise and use default LossWeights."""
+    loss_fn = CompositeLoss()
+    pred = torch.rand(1, 3, 32, 32)
+    gt   = torch.rand(1, 3, 32, 32)
+    lq   = torch.rand(1, 3, 32, 32)
+    total, bd = loss_fn(pred, gt, lq)
+    assert total.item() > 0
+
+
 # ---------------------------------------------------------------------------
 # CompositeLoss — breakdown stores raw unweighted values
 # ---------------------------------------------------------------------------

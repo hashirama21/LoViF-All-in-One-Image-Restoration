@@ -3,7 +3,8 @@ Inference engine — TTA + ensemble for LoViF challenge submission.
 
 TTA: 4-way (identity, hflip, vflip, rot90) → inverse-transform then mean.
 Ensemble: weighted average over N model checkpoints.
-Both are configurable from inference.yaml.
+Output images are resized back to the original input resolution before saving
+(required for challenge submission scoring).
 """
 from __future__ import annotations
 import logging
@@ -14,6 +15,7 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import DataLoader
+from torchvision import transforms
 from tqdm import tqdm
 from omegaconf import DictConfig
 
@@ -57,6 +59,10 @@ class InferenceEngine:
         self.device = torch.device(cfg.inference.get("device", "cuda"))
         self._dtype = torch.bfloat16
 
+        # Inference hyperparams — read from config, not hardcoded in checkpoint
+        self._num_steps      = cfg.inference.get("num_inference_steps", 25)
+        self._guidance_scale = cfg.inference.get("guidance_scale", 1.5)
+
         raw_weights: List[float] = list(cfg.inference.ensemble_weights)
         w_sum = sum(raw_weights)
         if abs(w_sum - 1.0) > 1e-4:
@@ -80,10 +86,11 @@ class InferenceEngine:
 
     def _load_model(self, ckpt_path: str) -> RestorationPipeline:
         state = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        if "model_config" in state:
-            model_cfg = PipelineConfig(**state["model_config"])
-        else:
-            model_cfg = PipelineConfig()
+        model_cfg = (
+            PipelineConfig(**state["model_config"])
+            if "model_config" in state
+            else PipelineConfig()
+        )
         model = RestorationPipeline(model_cfg).to(self.device)
         model.load_state_dict(state["model_state"], strict=False)
         model.eval()
@@ -101,11 +108,22 @@ class InferenceEngine:
         for model, w in zip(self.models, self.weights):
             with torch.autocast(device_type, dtype=self._dtype):
                 if self.tta_enabled:
-                    augmented = _tta_augment(lq.squeeze(0))     # list of [C, H, W]
-                    tta_outs  = [model.restore(a.unsqueeze(0)).squeeze(0) for a in augmented]
-                    merged    = _tta_deaugment(tta_outs).unsqueeze(0)
+                    augmented = _tta_augment(lq.squeeze(0))          # list of [C, H, W]
+                    tta_outs  = [
+                        model.restore(
+                            a.unsqueeze(0),
+                            num_inference_steps=self._num_steps,
+                            guidance_scale=self._guidance_scale,
+                        ).squeeze(0)
+                        for a in augmented
+                    ]
+                    merged = _tta_deaugment(tta_outs).unsqueeze(0)
                 else:
-                    merged = model.restore(lq)
+                    merged = model.restore(
+                        lq,
+                        num_inference_steps=self._num_steps,
+                        guidance_scale=self._guidance_scale,
+                    )
 
             ensemble_output = ensemble_output + w * merged
 
@@ -114,7 +132,7 @@ class InferenceEngine:
     def run(self, input_dir: str, output_dir: str) -> None:
         """
         Restores all images in input_dir and writes PNG results to output_dir.
-        Filenames are preserved (required by LoViF submission rules).
+        Output is resized back to the original input resolution before saving.
         """
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -124,14 +142,26 @@ class InferenceEngine:
         logger.info(
             f"Running inference on {len(dataset)} images "
             f"(TTA={'on' if self.tta_enabled else 'off'}, "
-            f"ensemble={len(self.models)} models)"
+            f"ensemble={len(self.models)} models, "
+            f"steps={self._num_steps}, guidance={self._guidance_scale})"
         )
 
         for batch in tqdm(loader, desc="LoViF inference"):
             lq       = batch["lq"].to(self.device)
             filename = batch["filename"][0]
+            orig_h   = int(batch["orig_h"][0])
+            orig_w   = int(batch["orig_w"][0])
 
-            restored = self.restore_single(lq)
+            restored = self.restore_single(lq)  # [1, C, 512, 512]
+
+            # Resize back to original resolution if different
+            if (orig_h, orig_w) != (restored.shape[-2], restored.shape[-1]):
+                restored = TF.resize(
+                    restored.squeeze(0),
+                    [orig_h, orig_w],
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                    antialias=True,
+                ).unsqueeze(0)
 
             img_pil = Image.fromarray(
                 (restored.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255)

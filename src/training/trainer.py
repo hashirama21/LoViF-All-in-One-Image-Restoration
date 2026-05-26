@@ -1,6 +1,6 @@
 """
 Trainer — main training loop for LoViF 2026.
-Handles: DDPM diffusion loss + optional pixel-space losses,
+Handles: DDPM diffusion loss (Min-SNR weighted) + optional pixel-space losses,
 mixed precision, gradient accumulation, early stopping,
 per-category validation, WandB logging.
 """
@@ -37,7 +37,7 @@ class Trainer:
     Self-contained trainer. Instantiate with Hydra config, then call .fit().
 
     Design:
-      - Primary loss: DDPM noise-prediction MSE (always, latent space).
+      - Primary loss: DDPM noise-prediction MSE with Min-SNR weighting (latent space).
       - Secondary loss: pixel-space L1 + LPIPS on decoded x0 estimate
         (activated when cfg.loss.pixel_loss_weight > 0).
       - Discriminator updated every step when adversarial weight > 0.
@@ -63,7 +63,7 @@ class Trainer:
             self.model.pipe.unet.enable_gradient_checkpointing()
 
         # --- Losses ---
-        self.diff_criterion = DiffusionLoss()
+        self.diff_criterion = DiffusionLoss(snr_gamma=cfg.loss.get("snr_gamma", 5.0))
         self._pixel_weight: float = cfg.loss.get("pixel_loss_weight", 0.0)
         loss_weights = LossWeights(
             l1=cfg.loss.l1_weight,
@@ -77,16 +77,19 @@ class Trainer:
         )
 
         # --- Data ---
+        # composite_pairs from config; None falls back to DEFAULT_COMPOSITE_PAIRS
+        composite_pairs = cfg.data.get("composite_pairs", None)
         train_ds = LoViFDataset(
             cfg.data.train_dir,
             composite_prob=cfg.data.get("composite_prob", 0.35),
+            composite_pairs=composite_pairs,
             augment=True,
         )
         val_ds = LoViFValDataset(cfg.data.val_dir, has_gt=True)
 
         self.train_loader = DataLoader(
             train_ds,
-            batch_size=cfg.data.batch_size,     # key lives under `data:`
+            batch_size=cfg.data.batch_size,
             shuffle=True,
             num_workers=cfg.data.num_workers,
             pin_memory=True,
@@ -130,9 +133,9 @@ class Trainer:
                 lr=cfg.training.lr * 0.5,
             )
 
-        # GradScaler is only needed for fp16; bfloat16 has fp32 dynamic range
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=(cfg.training.mixed_precision == "fp16")
+        # GradScaler only for fp16; bfloat16 has fp32 dynamic range
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=(cfg.training.mixed_precision == "fp16")
         )
 
         # --- Infrastructure ---
@@ -153,8 +156,8 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def fit(self) -> None:
-        cfg = self.cfg.training
-        step = 0
+        cfg         = self.cfg.training
+        step        = 0
         accum_steps = cfg.gradient_accumulation_steps
         device_type = self.device.type
 
@@ -167,7 +170,9 @@ class Trainer:
             if self.disc_optimizer:
                 self.disc_optimizer.zero_grad()
 
-            breakdown: dict[str, float] = {}
+            # Accumulate loss breakdown across sub-batches for accurate logging
+            accum_bd: dict[str, list[float]] = {}
+            pred_pixel = None
 
             for _ in range(accum_steps):
                 try:
@@ -180,19 +185,19 @@ class Trainer:
                 gt = batch["gt"].to(self.device)
 
                 with torch.autocast(device_type, dtype=self._dtype):
-                    noise_pred, noise, z0_pred = self.model(lq, gt)
+                    noise_pred, noise, z0_pred, alpha_t = self.model(lq, gt)
 
-                    diff_loss, diff_bd = self.diff_criterion(noise_pred, noise)
-                    breakdown.update(diff_bd)
+                    diff_loss, diff_bd = self.diff_criterion(
+                        noise_pred, noise, alphas_cumprod_t=alpha_t
+                    )
                     total = diff_loss
 
-                    pred_pixel = None
                     if self.pixel_criterion is not None:
                         pred_pixel = self.model.decode_latent(z0_pred)
                         pixel_loss, pixel_bd = self.pixel_criterion(
                             pred_pixel.float(), gt.float(), lq.float()
                         )
-                        breakdown.update({f"px_{k}": v for k, v in pixel_bd.items()})
+                        diff_bd.update({f"px_{k}": v for k, v in pixel_bd.items()})
                         total = total + self._pixel_weight * pixel_loss
 
                     total = total / accum_steps
@@ -200,7 +205,7 @@ class Trainer:
                 self.scaler.scale(total).backward()
 
                 # Discriminator step within the same accumulation iteration
-                if self.disc_optimizer is not None:
+                if self.disc_optimizer is not None and pred_pixel is not None:
                     with torch.autocast(device_type, dtype=self._dtype):
                         disc_loss = (
                             self.pixel_criterion.adversarial.forward_discriminator(
@@ -208,6 +213,13 @@ class Trainer:
                             ) / accum_steps
                         )
                     self.scaler.scale(disc_loss).backward()
+                    diff_bd["disc_loss"] = disc_loss.item() * accum_steps
+
+                for k, v in diff_bd.items():
+                    accum_bd.setdefault(k, []).append(v)
+
+            # Average breakdown across accumulation sub-batches
+            breakdown = {k: sum(v) / len(v) for k, v in accum_bd.items()}
 
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(list(self.model.trainable_parameters()), 1.0)
@@ -252,7 +264,7 @@ class Trainer:
 
             self.metrics.update(pred.float(), gt.float(), category=cat)
 
-        summary = self.metrics.summary()
+        summary      = self.metrics.summary()
         global_lpips = summary["all"]["lpips"]
         global_psnr  = summary["all"]["psnr"]
 
@@ -269,10 +281,10 @@ class Trainer:
                 logger.info(f"  {cat:12s}: PSNR={vals['psnr']:.2f} LPIPS={vals['lpips']:.4f}")
 
         state = {
-            "model_state":   self.model.state_dict(),
-            "model_config":  self.model.as_config_dict(),
+            "model_state":     self.model.state_dict(),
+            "model_config":    self.model.as_config_dict(),
             "optimizer_state": self.optimizer.state_dict(),
-            "metrics":       summary,
+            "metrics":         summary,
         }
         should_stop = self.ckpt_manager.step(global_lpips, state, step)
         self.model.train()
