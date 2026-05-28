@@ -192,11 +192,12 @@ class RestorationPipeline(nn.Module):
                 B, 1, self._cross_attn_dim, device=lq.device, dtype=lq.dtype
             )
 
-        deg_tokens = self.degradation_encoder(lq.float())  # [B, 197, encoder_dim]
+        lq_f = lq.float()  # single cast — shared across encoder + all priors
+        deg_tokens = self.degradation_encoder(lq_f)  # [B, 197, encoder_dim]
 
         if self.retinex is not None:
-            illum, reflect  = self.retinex(lq.float())      # [B,1,H,W] / [B,3,H,W]
-            transmission    = self.dark_channel(lq.float())  # [B,1,H,W]
+            illum, reflect  = self.retinex(lq_f)      # [B,1,H,W] / [B,3,H,W]
+            transmission    = self.dark_channel(lq_f)  # [B,1,H,W]
 
             priors = torch.cat([illum, reflect, transmission], dim=1)  # [B, 5, H, W]
             P = self.config.prior_pool_size

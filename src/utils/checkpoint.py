@@ -63,13 +63,12 @@ class CheckpointManager:
 
     @staticmethod
     def _save(state: Dict[str, Any], path: Path, step: int) -> None:
-        state["step"] = step
-        torch.save(state, path)
+        torch.save({**state, "step": step}, path)  # copy — never mutate caller's dict
         logger.debug(f"Checkpoint saved → {path}")
 
     @staticmethod
     def load(path: str, device: str = "cpu") -> Dict[str, Any]:
-        return torch.load(path, map_location=device)
+        return torch.load(path, map_location=device, weights_only=False)
 
 
 class WandbLogger:

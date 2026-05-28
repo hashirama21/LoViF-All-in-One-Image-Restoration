@@ -28,8 +28,10 @@ dpo:
   lr: 2e-6
   warmup_steps: 100
   max_steps: 3000
-  batch_size: 2
+  batch_size: 2                            # effective 2B in U-Net (chosen+rejected batched)
   gradient_accumulation_steps: 4
+  # Memory: two full RestorationPipeline instances loaded simultaneously.
+  # Requires ~14–20 GB VRAM. Use batch_size=1 on 16 GB GPUs.
 
 data:
   val_dir: ./data/validation

@@ -53,9 +53,12 @@ class Trainer:
         # --- Model ---
         model_cfg = PipelineConfig(
             lora_rank=cfg.model.lora_rank,
+            lora_alpha=cfg.model.get("lora_alpha", 64),
+            lora_dropout=cfg.model.get("lora_dropout", 0.1),
             use_degradation_encoder=cfg.model.use_degradation_encoder,
             encoder_dim=cfg.model.get("encoder_dim", 512),
             use_physical_priors=cfg.model.get("use_physical_priors", True),
+            prior_pool_size=cfg.model.get("prior_pool_size", 7),
         )
         self.model = RestorationPipeline(model_cfg).to(self.device)
 

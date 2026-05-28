@@ -28,7 +28,12 @@ class DPOTrainer:
     Reference model = frozen copy of the base checkpoint (no graph built).
     Policy model    = trainable (LoRA + encoder projections only).
     Log-prob proxy  = negative noise-prediction MSE in latent space.
-    Breakdown is averaged across all accumulation sub-batches (not last-only).
+
+    Efficiency: chosen + rejected are batched into a single 2B forward per model,
+    halving the number of U-Net calls from 4 to 2 per accumulation sub-step.
+
+    Memory note: two full RestorationPipeline instances are loaded simultaneously.
+    Requires ~14–20 GB VRAM. Use batch_size=1 on 16 GB GPUs.
     """
 
     def __init__(self, cfg: DictConfig) -> None:
@@ -84,9 +89,12 @@ class DPOTrainer:
             cfg_m = self.cfg.model
             model_cfg = PipelineConfig(
                 lora_rank=cfg_m.lora_rank,
+                lora_alpha=cfg_m.get("lora_alpha", 64),
+                lora_dropout=cfg_m.get("lora_dropout", 0.1),
                 use_degradation_encoder=cfg_m.use_degradation_encoder,
                 encoder_dim=cfg_m.get("encoder_dim", 512),
                 use_physical_priors=cfg_m.get("use_physical_priors", True),
+                prior_pool_size=cfg_m.get("prior_pool_size", 7),
             )
 
         model = RestorationPipeline(model_cfg).to(self.device)
@@ -99,31 +107,54 @@ class DPOTrainer:
         return model
 
     # ------------------------------------------------------------------
-    # Log-prob proxies — separated so reference always runs under no_grad
+    # Log-prob proxies — chosen + rejected batched into one forward
     # ------------------------------------------------------------------
 
-    def _compute_policy_log_prob(
-        self, lq: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
-        """Policy proxy — gradients flow through noise_pred."""
+    def _compute_policy_log_probs(
+        self,
+        lq: torch.Tensor,
+        chosen: torch.Tensor,
+        rejected: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Single U-Net forward through policy for both chosen and rejected.
+        Input batch is doubled: [chosen; rejected] along dim 0.
+        Returns (log_prob_chosen [B], log_prob_rejected [B]).
+        """
+        B = lq.shape[0]
         with torch.autocast(self.device.type, dtype=self._dtype):
-            noise_pred, noise, _, _ = self.policy(lq, target)
-        return -F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3])
+            noise_pred, noise, _, _ = self.policy(
+                lq.repeat(2, 1, 1, 1),
+                torch.cat([chosen, rejected], dim=0),
+            )
+        per = -F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3])  # [2B]
+        return per[:B], per[B:]
 
-    def _compute_ref_log_prob(
-        self, lq: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
-        """Reference proxy — no graph constructed, no memory overhead."""
+    def _compute_ref_log_probs(
+        self,
+        lq: torch.Tensor,
+        chosen: torch.Tensor,
+        rejected: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Single U-Net forward through reference under no_grad.
+        No compute graph — no memory overhead beyond the forward pass itself.
+        """
+        B = lq.shape[0]
         with torch.no_grad(), torch.autocast(self.device.type, dtype=self._dtype):
-            noise_pred, noise, _, _ = self.reference(lq, target)
-        return -F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3])
+            noise_pred, noise, _, _ = self.reference(
+                lq.repeat(2, 1, 1, 1),
+                torch.cat([chosen, rejected], dim=0),
+            )
+        per = -F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3])
+        return per[:B], per[B:]
 
     # ------------------------------------------------------------------
 
     def fit(self) -> None:
-        step     = 0
+        step      = 0
         max_steps = self.cfg.dpo.max_steps
-        accum    = self.cfg.dpo.gradient_accumulation_steps
+        accum     = self.cfg.dpo.gradient_accumulation_steps
 
         logger.info(f"DPO stage — {max_steps} steps on {self.device}.")
         self.policy.train()
@@ -134,7 +165,6 @@ class DPOTrainer:
         while step < max_steps:
             self.optimizer.zero_grad()
 
-            # Accumulate breakdown across sub-batches for accurate logging
             accum_bd: dict[str, list[float]] = {}
 
             for _ in range(accum):
@@ -148,10 +178,8 @@ class DPOTrainer:
                 chosen   = batch["chosen"].to(self.device)
                 rejected = batch["rejected"].to(self.device)
 
-                pi_chosen    = self._compute_policy_log_prob(lq, chosen)
-                pi_rejected  = self._compute_policy_log_prob(lq, rejected)
-                ref_chosen   = self._compute_ref_log_prob(lq, chosen)
-                ref_rejected = self._compute_ref_log_prob(lq, rejected)
+                pi_chosen,  pi_rejected  = self._compute_policy_log_probs(lq, chosen, rejected)
+                ref_chosen, ref_rejected = self._compute_ref_log_probs(lq, chosen, rejected)
 
                 loss, bd = self.dpo_loss(
                     pi_chosen, pi_rejected, ref_chosen, ref_rejected

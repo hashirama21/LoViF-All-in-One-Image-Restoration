@@ -53,9 +53,14 @@ class DegradationEncoder(nn.Module):
         lq_224 = F.interpolate(lq, size=(224, 224), mode="bicubic", align_corners=False)
         pixel_values = (lq_224 - self._clip_mean) / self._clip_std
 
-        grad_ctx = torch.no_grad() if self._clip_frozen() else torch.enable_grad()
-        with grad_ctx:
-            hidden = self.clip(pixel_values=pixel_values).last_hidden_state  # [B, 197, 768]
+        # torch.enable_grad() cannot override @torch.inference_mode() — use
+        # explicit no_grad for the frozen path only; the unfrozen path inherits
+        # whatever context is active (training loop's autocast, etc.).
+        if self._clip_frozen():
+            with torch.no_grad():
+                hidden = self.clip(pixel_values=pixel_values).last_hidden_state
+        else:
+            hidden = self.clip(pixel_values=pixel_values).last_hidden_state
 
         return self.projection(hidden)  # [B, 197, output_dim]
 

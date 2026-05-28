@@ -3,7 +3,9 @@ scripts/dpo_stage.py — preference optimization stage.
 Run AFTER train.py has produced outputs/*/best.ckpt.
 
 Usage:
-    python scripts/dpo_stage.py config=configs/dpo.yaml
+    python scripts/dpo_stage.py                     # default: dpo.yaml
+    python scripts/dpo_stage.py --config-name=dpo   # explicit
+    python scripts/dpo_stage.py dpo.lr=1e-6         # override a key
 """
 import logging
 import sys
