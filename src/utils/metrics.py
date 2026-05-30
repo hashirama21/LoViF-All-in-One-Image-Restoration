@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 from torchmetrics.functional import peak_signal_noise_ratio, structural_similarity_index_measure
 import lpips
 
@@ -58,7 +57,8 @@ class MetricBag:
         pred, gt: float tensors [B, C, H, W] in [0, 1].
         Returns per-sample metrics dict.
         """
-        assert pred.shape == gt.shape, "pred/gt shape mismatch"
+        if pred.shape != gt.shape:
+            raise ValueError(f"pred/gt shape mismatch: {pred.shape} vs {gt.shape}")
 
         psnr = peak_signal_noise_ratio(pred, gt, data_range=1.0).item()
         ssim = structural_similarity_index_measure(pred, gt, data_range=1.0).item()

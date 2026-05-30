@@ -40,3 +40,4 @@ loss:
   lpips_weight: 0.0
   adversarial_weight: 0.0
   pixel_loss_weight: 0.0       # diffusion MSE only for baseline
+  snr_gamma: 5.0               # Min-SNR-γ weighting (Hang et al., 2023)

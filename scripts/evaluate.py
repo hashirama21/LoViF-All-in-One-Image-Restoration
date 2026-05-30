@@ -35,9 +35,13 @@ def main() -> None:
 
     device = torch.device(args.device)
 
-    # Load model
-    model = RestorationPipeline(PipelineConfig()).to(device)
-    state = torch.load(args.checkpoint, map_location=device)
+    # Load model — reconstruct config from checkpoint if available
+    state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if "model_config" in state:
+        model_cfg = PipelineConfig(**state["model_config"])
+    else:
+        model_cfg = PipelineConfig()
+    model = RestorationPipeline(model_cfg).to(device)
     model.load_state_dict(state["model_state"], strict=False)
     model.eval()
     logger.info(f"Loaded: {args.checkpoint}")
@@ -54,7 +58,7 @@ def main() -> None:
             gt  = batch["gt"].to(device)
             cat = batch["category"][0]
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(device.type, dtype=torch.bfloat16):
                 pred = model.restore(lq)
 
             metrics.update(pred.float(), gt.float(), category=cat)

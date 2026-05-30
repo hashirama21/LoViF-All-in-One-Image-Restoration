@@ -3,7 +3,7 @@ scripts/infer.py — final LoViF 2026 challenge inference.
 Produces PNG outputs ready for submission.
 
 Usage:
-    python scripts/infer.py config=configs/inference.yaml \
+    python scripts/infer.py \
         inference.input_dir=./validation_inputs \
         inference.output_dir=./validation_outputs
 """

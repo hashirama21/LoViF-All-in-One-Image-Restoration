@@ -90,12 +90,12 @@ class RewardModel(nn.Module):
     @torch.inference_mode()
     def score(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
         """Returns composite quality score [B] — higher is better."""
-        lpips_dist  = self._lpips(pred * 2 - 1, gt * 2 - 1).squeeze().clamp(0, 1)
+        lpips_dist  = self._lpips(pred * 2 - 1, gt * 2 - 1).view(-1).clamp(0, 1)
         lpips_score = 1.0 - lpips_dist
 
         if self._musiq is not None:
-            musiq_score    = self._musiq(pred).squeeze().clamp(0, 1)
-            clip_iqa_score = self._clip_iqa(pred).squeeze().clamp(0, 1)
+            musiq_score    = self._musiq(pred).view(-1).clamp(0, 1)
+            clip_iqa_score = self._clip_iqa(pred).view(-1).clamp(0, 1)
             w_total = self.w_musiq + self.w_clip_iqa + self.w_lpips
             return (
                 self.w_musiq    * musiq_score
